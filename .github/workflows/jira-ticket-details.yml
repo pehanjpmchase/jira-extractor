@@ -1,10 +1,10 @@
-name: Extract Jira Ticket Details
+name: Export All Jira Tickets
 
 on:
   workflow_dispatch:
     inputs:
-      ticket_key:
-        description: "Jira ticket key (e.g. PROJ-123)"
+      project_key:
+        description: "Jira project/space key (e.g. PROJ)"
         required: true
         type: string
 
@@ -15,7 +15,7 @@ env:
   JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}      # Jira API token
 
 jobs:
-  extract-jira-ticket:
+  export-tickets:
     runs-on: ubuntu-latest
 
     steps:
@@ -28,64 +28,97 @@ jobs:
             fi
           done
 
-      - name: Fetch ticket from Jira
+      - name: Export all tickets to CSV
         env:
-          TICKET_KEY: ${{ inputs.ticket_key }}
+          PROJECT_KEY: ${{ inputs.project_key }}
         run: |
-          set -euo pipefail
-          BASE_URL="${JIRA_BASE_URL%/}"
+          cat > export_jira.py << 'PYEOF'
+          import base64
+          import csv
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
 
-          HTTP_CODE=$(curl -sS -o ticket_raw.json -w "%{http_code}" \
-            -u "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
-            -H "Accept: application/json" \
-            "${BASE_URL}/rest/api/3/issue/${TICKET_KEY}")
+          base_url = os.environ["JIRA_BASE_URL"].rstrip("/")
+          email = os.environ["JIRA_USER_EMAIL"]
+          token = os.environ["JIRA_API_TOKEN"]
+          project = os.environ["PROJECT_KEY"].strip()
 
-          if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "::error::Jira API returned HTTP ${HTTP_CODE}"
-            cat ticket_raw.json
-            exit 1
-          fi
+          auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+          headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
 
-      - name: Save ticket details as CSV
-        run: |
-          set -euo pipefail
+          jql = f'project = "{project}" ORDER BY created ASC'
+          fields = "summary,status,issuetype,priority,assignee,reporter,labels,created,updated,duedate,project"
 
-          jq -r --arg base "${JIRA_BASE_URL%/}" '
-            [
-              "key","url","summary","status","type","priority",
-              "assignee","reporter","labels","created","updated","due_date","project"
-            ],
-            [
-              .key,
-              ($base + "/browse/" + .key),
-              .fields.summary,
-              .fields.status.name,
-              .fields.issuetype.name,
-              (.fields.priority.name // ""),
-              (.fields.assignee.displayName // "Unassigned"),
-              (.fields.reporter.displayName // "Unknown"),
-              ((.fields.labels // []) | join(";")),
-              .fields.created,
-              .fields.updated,
-              (.fields.duedate // ""),
-              .fields.project.name
-            ] | @csv
-          ' ticket_raw.json > ticket_details.csv
+          columns = ["key", "url", "summary", "status", "type", "priority",
+                     "assignee", "reporter", "labels", "created", "updated",
+                     "due_date", "project"]
 
-          cat ticket_details.csv
+          def name_of(obj, attr="name", default=""):
+              return (obj or {}).get(attr, default) or default
+
+          rows = []
+          next_token = None
+
+          while True:
+              params = {"jql": jql, "fields": fields, "maxResults": "100"}
+              if next_token:
+                  params["nextPageToken"] = next_token
+              url = f"{base_url}/rest/api/3/search/jql?{urllib.parse.urlencode(params)}"
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      data = json.load(resp)
+              except urllib.error.HTTPError as e:
+                  print(f"::error::Jira API returned HTTP {e.code}: {e.read().decode()}")
+                  sys.exit(1)
+
+              for issue in data.get("issues", []):
+                  f = issue["fields"]
+                  rows.append([
+                      issue["key"],
+                      f"{base_url}/browse/{issue['key']}",
+                      f.get("summary", ""),
+                      name_of(f.get("status")),
+                      name_of(f.get("issuetype")),
+                      name_of(f.get("priority")),
+                      name_of(f.get("assignee"), "displayName", "Unassigned"),
+                      name_of(f.get("reporter"), "displayName", "Unknown"),
+                      ";".join(f.get("labels") or []),
+                      f.get("created", ""),
+                      f.get("updated", ""),
+                      f.get("duedate") or "",
+                      name_of(f.get("project")),
+                  ])
+
+              print(f"Fetched {len(rows)} tickets so far...")
+              next_token = data.get("nextPageToken")
+              if not next_token or data.get("isLast"):
+                  break
+
+          with open("jira_tickets.csv", "w", newline="", encoding="utf-8") as fh:
+              writer = csv.writer(fh)
+              writer.writerow(columns)
+              writer.writerows(rows)
+
+          print(f"Done. Exported {len(rows)} tickets.")
+          PYEOF
+
+          python3 export_jira.py
 
       - name: Write job summary
+        env:
+          PROJECT_KEY: ${{ inputs.project_key }}
         run: |
-          {
-            echo "## Jira Ticket: ${{ inputs.ticket_key }}"
-            echo ""
-            echo '```csv'
-            cat ticket_details.csv
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          COUNT=$(( $(wc -l < jira_tickets.csv) - 1 ))
+          echo "## Jira export: ${PROJECT_KEY}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Exported **${COUNT}** tickets to \`jira_tickets.csv\`." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload CSV
         uses: actions/upload-artifact@v4
         with:
-          name: jira-ticket-${{ inputs.ticket_key }}
-          path: ticket_details.csv
+          name: jira-${{ inputs.project_key }}-all-tickets
+          path: jira_tickets.csv
