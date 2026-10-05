@@ -1,0 +1,91 @@
+name: Extract Jira Ticket Details
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticket_key:
+        description: "Jira ticket key (e.g. PROJ-123)"
+        required: true
+        type: string
+
+env:
+  # Add these later in: Repo > Settings > Secrets and variables > Actions
+  JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}        # e.g. https://your-company.atlassian.net
+  JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}    # email of the Jira account that owns the token
+  JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}      # Jira API token
+
+jobs:
+  extract-jira-ticket:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate configuration
+        run: |
+          for var in JIRA_BASE_URL JIRA_USER_EMAIL JIRA_API_TOKEN; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Missing secret: $var"
+              exit 1
+            fi
+          done
+
+      - name: Fetch ticket from Jira
+        env:
+          TICKET_KEY: ${{ inputs.ticket_key }}
+        run: |
+          set -euo pipefail
+          BASE_URL="${JIRA_BASE_URL%/}"
+
+          HTTP_CODE=$(curl -sS -o ticket_raw.json -w "%{http_code}" \
+            -u "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
+            -H "Accept: application/json" \
+            "${BASE_URL}/rest/api/3/issue/${TICKET_KEY}")
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::Jira API returned HTTP ${HTTP_CODE}"
+            cat ticket_raw.json
+            exit 1
+          fi
+
+      - name: Save ticket details as CSV
+        run: |
+          set -euo pipefail
+
+          jq -r --arg base "${JIRA_BASE_URL%/}" '
+            [
+              "key","url","summary","status","type","priority",
+              "assignee","reporter","labels","created","updated","due_date","project"
+            ],
+            [
+              .key,
+              ($base + "/browse/" + .key),
+              .fields.summary,
+              .fields.status.name,
+              .fields.issuetype.name,
+              (.fields.priority.name // ""),
+              (.fields.assignee.displayName // "Unassigned"),
+              (.fields.reporter.displayName // "Unknown"),
+              ((.fields.labels // []) | join(";")),
+              .fields.created,
+              .fields.updated,
+              (.fields.duedate // ""),
+              .fields.project.name
+            ] | @csv
+          ' ticket_raw.json > ticket_details.csv
+
+          cat ticket_details.csv
+
+      - name: Write job summary
+        run: |
+          {
+            echo "## Jira Ticket: ${{ inputs.ticket_key }}"
+            echo ""
+            echo '```csv'
+            cat ticket_details.csv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: jira-ticket-${{ inputs.ticket_key }}
+          path: ticket_details.csv
